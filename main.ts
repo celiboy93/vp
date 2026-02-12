@@ -1,70 +1,58 @@
 const kv = await Deno.openKv();
-const ADMIN_PASSWORD = "admin"; 
+const ADMIN_PASSWORD = "admin";
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   const path = url.pathname;
-  const method = req.method;
-  const headers = {
-    "content-type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS"
-  };
-  if (method === "OPTIONS") return new Response(null, { headers });
-  if (method === "GET" && path === "/") {
-    return new Response(renderHTML(), { headers: { "content-type": "text/html; charset=utf-8" } });
-  }
   let params = {};
   try {
     const text = await req.text();
-    if (text.startsWith("{")) {
-        params = JSON.parse(text);
-    } else {
-        const urlParams = new URLSearchParams(text);
-        params = Object.fromEntries(urlParams);
-    }
-  } catch (e) { }
+    if (text.startsWith("{")) params = JSON.parse(text);
+    else params = Object.fromEntries(new URLSearchParams(text));
+  } catch (e) {}
+  const headers = {
+    "content-type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*"
+  };
   if (path.includes("login")) {
-    const { username, password } = params;
+    const { username, password, device_id } = params;
     const entry = await kv.get(["users", username]);
-    if (!entry.value) {
-      return new Response(JSON.stringify({ status: "fail", message: "User not found" }), { headers });
-    }
+    if (!entry.value) return new Response(JSON.stringify({ status: "fail", message: "User not found" }), { headers });
     const account = entry.value;
-    if (account.password !== password) {
-      return new Response(JSON.stringify({ status: "fail", message: "Wrong Password" }), { headers });
-    }
-    if (Date.now() > account.expiry) {
-      return new Response(JSON.stringify({ status: "expired", message: "Account Expired" }), { headers });
+    if (account.password !== password) return new Response(JSON.stringify({ status: "fail", message: "Wrong Password" }), { headers });
+    if (Date.now() > account.expiry) return new Response(JSON.stringify({ status: "expired", message: "Expired" }), { headers });
+    const userDevId = device_id || "unknown";
+    if (account.device_id && account.device_id !== userDevId) {
+       return new Response(JSON.stringify({ status: "fail", message: "Device Mismatch" }), { headers });
     }
     const remainingDays = Math.ceil((account.expiry - Date.now()) / (24 * 60 * 60 * 1000));
-    const expiryString = remainingDays.toString();
+    const expiryString = remainingDays.toString(); 
     if (account.device_id) {
         return new Response(JSON.stringify({
             "status": "re_login",
             "user": username,
-            "expired_date": expiryString,
-            "device_id": account.device_id, 
-            "message": "Login Success",
+            "expired_date": account.expiry.toString(), 
+            "device_id": account.device_id,
+            "message": "Welcome Back",
             "access": "true"
         }), { headers });
     }
     return new Response(JSON.stringify({
         "status": "login",
         "user": username,
-        "expired_date": expiryString,
-        "message": "First Login Success",
+        "expired_date": expiryString, 
+        "message": "Login Success",
         "access": "true"
     }), { headers });
   }
   if (path.includes("reupload") || path.includes("edit")) {
-     const { username, device_id } = params;
-     if (username && device_id) {
+     const { username, device_id, expired_date } = params;
+     if (username) {
          const entry = await kv.get(["users", username]);
          if (entry.value) {
-             const account = entry.value;
-             if (!account.device_id) {
-                 account.device_id = device_id;
-                 await kv.set(["users", username], account);
+             const acc = entry.value;
+             if (!acc.device_id && device_id) {
+                 acc.device_id = device_id;
+                 await kv.set(["users", username], acc);
              }
          }
      }
@@ -83,131 +71,44 @@ Deno.serve(async (req) => {
      if(username) await kv.delete(["users", username]);
      return new Response(JSON.stringify({"status": "success"}), { headers });
   }
+  if (req.method === "GET" && path === "/") return new Response(renderHTML(), { headers: { "content-type": "text/html" } });
   if (path.startsWith("/api/")) {
-    if (params.adminPass !== ADMIN_PASSWORD) return new Response(JSON.stringify({ status: "fail" }), { headers });
-    if (path === "/api/list") {
-        const users = [];
-        for await (const entry of kv.list({ prefix: ["users"] })) users.push(entry.value);
-        return new Response(JSON.stringify({ status: "success", data: users }), { headers });
-    }
-    if (path === "/api/create") {
-        const { username, password, days } = params;
-        const existing = await kv.get(["users", username]);
-        if (existing.value) return new Response(JSON.stringify({ status: "fail", message: "Exists" }), { headers });
-        const expiryDate = Date.now() + (parseInt(days) * 24 * 60 * 60 * 1000);
-        await kv.set(["users", username], { username, password, expiry: expiryDate, device_id: null, status: "active" });
-        return new Response(JSON.stringify({ status: "success" }), { headers });
-    }
-    if (path === "/api/resetid") {
-        const { username } = params;
-        const entry = await kv.get(["users", username]);
-        if(entry.value) {
-            const acc = entry.value;
-            acc.device_id = null; 
-            await kv.set(["users", username], acc);
-        }
-        return new Response(JSON.stringify({ status: "success" }), { headers });
-    }
-    if (path === "/api/extend") {
-        const { username, days } = params;
-        const entry = await kv.get(["users", username]);
-        if (entry.value) {
-            const acc = entry.value;
-            const current = acc.expiry > Date.now() ? acc.expiry : Date.now();
-            acc.expiry = current + (parseInt(days) * 24 * 60 * 60 * 1000);
-            await kv.set(["users", username], acc);
-        }
-        return new Response(JSON.stringify({ status: "success" }), { headers });
-    }
-    if (path === "/api/delete") {
-        await kv.delete(["users", params.username]);
-        return new Response(JSON.stringify({ status: "success" }), { headers });
-    }
+      if (params.adminPass !== ADMIN_PASSWORD) return new Response(JSON.stringify({status:"fail"}),{headers});
+      if (path === "/api/list") {
+          const users = [];
+          for await (const entry of kv.list({ prefix: ["users"] })) users.push(entry.value);
+          return new Response(JSON.stringify({status:"success", data:users}),{headers});
+      }
+      if (path === "/api/create") {
+          const exp = Date.now() + (parseInt(params.days) * 86400000);
+          await kv.set(["users", params.username], { 
+              username: params.username, 
+              password: params.password, 
+              expiry: exp, 
+              device_id: null 
+          });
+          return new Response(JSON.stringify({status:"success"}),{headers});
+      }
+      if (path === "/api/resetid") {
+          const e = await kv.get(["users", params.username]);
+          if(e.value) { e.value.device_id = null; await kv.set(["users", params.username], e.value); }
+          return new Response(JSON.stringify({status:"success"}),{headers});
+      }
+      if (path === "/api/extend") {
+          const e = await kv.get(["users", params.username]);
+          if(e.value) { 
+            e.value.expiry = Math.max(Date.now(), e.value.expiry) + (parseInt(params.days)*86400000); 
+            await kv.set(["users", params.username], e.value); 
+          }
+          return new Response(JSON.stringify({status:"success"}),{headers});
+      }
+      if (path === "/api/delete") {
+          await kv.delete(["users", params.username]);
+          return new Response(JSON.stringify({status:"success"}),{headers});
+      }
   }
-  return new Response("VIP Server Online", { status: 404 });
+  return new Response("VIP Server", { status: 200 });
 });
 function renderHTML() {
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VIP Manager</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>body{background:#0f172a;color:white;}</style>
-</head>
-<body class="flex justify-center min-h-screen p-4">
-    <div id="login" class="w-full max-w-sm mt-20 text-center">
-        <h2 class="text-2xl font-bold mb-4 text-cyan-400">Admin Panel</h2>
-        <input type="password" id="pass" class="w-full p-3 rounded bg-slate-800 border border-slate-600 mb-4" placeholder="Password">
-        <button onclick="login()" class="w-full bg-cyan-600 p-3 rounded font-bold">ENTER</button>
-    </div>
-    <div id="panel" class="w-full max-w-5xl hidden">
-        <div class="flex justify-between items-center mb-8 mt-4">
-            <h1 class="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500">VIP MANAGER</h1>
-            <button onclick="logout()" class="text-red-400">Logout</button>
-        </div>
-        <div class="bg-slate-800 p-4 rounded-xl mb-6 flex gap-2 flex-col md:flex-row">
-            <input id="u" placeholder="Username" class="p-3 bg-slate-700 rounded flex-1">
-            <input id="p" placeholder="Password" class="p-3 bg-slate-700 rounded flex-1">
-            <input id="d" type="number" value="30" placeholder="Days" class="p-3 bg-slate-700 rounded w-24">
-            <button onclick="create()" class="bg-green-600 px-6 py-3 rounded font-bold">Create</button>
-        </div>
-        <div class="overflow-x-auto bg-slate-800 rounded-xl">
-            <table class="w-full text-left text-sm">
-                <thead class="bg-slate-900 text-slate-400">
-                    <tr>
-                        <th class="p-3">User</th>
-                        <th class="p-3">Pass</th>
-                        <th class="p-3">Expires</th>
-                        <th class="p-3">Device ID</th>
-                        <th class="p-3 text-right">Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="list"></tbody>
-            </table>
-        </div>
-    </div>
-    <script>
-        let TOKEN = localStorage.getItem("t");
-        if(TOKEN) show();
-        function login() { TOKEN = document.getElementById("pass").value; localStorage.setItem("t", TOKEN); show(); }
-        function logout() { localStorage.removeItem("t"); location.reload(); }
-        function show() { document.getElementById("login").classList.add("hidden"); document.getElementById("panel").classList.remove("hidden"); load(); }
-        async function req(ep, data) {
-            data.adminPass = TOKEN;
-            const res = await fetch(ep, { method: "POST", body: JSON.stringify(data) });
-            return await res.json();
-        }
-        async function load() {
-            const res = await req("/api/list", {});
-            if(res.status!=="success") return;
-            const tb = document.getElementById("list"); tb.innerHTML = "";
-            res.data.sort((a,b)=>a.expiry-b.expiry).forEach(u => {
-                const days = Math.ceil((u.expiry - Date.now())/86400000);
-                const dev = u.device_id ? "<span class='font-mono text-cyan-300'>"+u.device_id+"</span>" : "<span class='text-gray-500'>Waiting...</span>";
-                const row = \`
-                <tr class="border-b border-slate-700 hover:bg-slate-700">
-                    <td class="p-3 font-bold">\${u.username}</td>
-                    <td class="p-3 text-slate-400">\${u.password}</td>
-                    <td class="p-3">\${new Date(u.expiry).toLocaleDateString()} (\${days}d)</td>
-                    <td class="p-3 text-xs">\${dev}</td>
-                    <td class="p-3 text-right space-x-1">
-                        <button onclick="reset('\${u.username}')" class="bg-yellow-600 text-white px-2 py-1 rounded text-xs">Reset ID</button>
-                        <button onclick="ext('\${u.username}')" class="bg-blue-600 text-white px-2 py-1 rounded text-xs">Renew</button>
-                        <button onclick="del('\${u.username}')" class="bg-red-600 text-white px-2 py-1 rounded text-xs">Del</button>
-                    </td>
-                </tr>\`;
-                tb.innerHTML += row;
-            });
-        }
-        async function create() { await req("/api/create", { username: document.getElementById("u").value, password: document.getElementById("p").value, days: document.getElementById("d").value }); document.getElementById("u").value=""; load(); }
-        async function ext(u) { const d = prompt("Days:", "30"); if(d) { await req("/api/extend", {username:u, days:d}); load(); } }
-        async function del(u) { if(confirm("Del?")) { await req("/api/delete", {username:u}); load(); } }
-        async function reset(u) { if(confirm("Reset Device ID?")) { await req("/api/resetid", {username:u}); load(); } }
-    </script>
-</body>
-</html>
-  `;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>VIP Manager</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#111827;color:#fff}</style></head><body class="flex justify-center p-5"><div id="auth" class="w-full max-w-sm mt-10 p-5 bg-gray-800 rounded"><h2 class="text-xl mb-3 text-cyan-400 font-bold">Admin Login</h2><input id="pw" type="password" class="w-full p-2 bg-gray-700 rounded mb-3" placeholder="Password"><button onclick="login()" class="w-full bg-cyan-600 p-2 rounded">LOGIN</button></div><div id="app" class="w-full max-w-4xl hidden"><div class="flex justify-between mb-5"><h1 class="text-2xl font-bold text-cyan-400">VIP MANAGER</h1><button onclick="logout()" class="text-red-400">Logout</button></div><div class="flex gap-2 mb-5"><input id="u" placeholder="User" class="p-2 bg-gray-800 rounded flex-1"><input id="p" placeholder="Pass" class="p-2 bg-gray-800 rounded flex-1"><input id="d" type="number" value="30" class="p-2 bg-gray-800 rounded w-16"><button onclick="api('/api/create',{username:getId('u'),password:getId('p'),days:getId('d')})" class="bg-green-600 p-2 rounded">Create</button></div><table class="w-full text-sm bg-gray-800 rounded overflow-hidden"><thead class="bg-gray-900 text-left"><tr><th class="p-3">User</th><th class="p-3">Pass</th><th class="p-3">Expires</th><th class="p-3">Device</th><th class="p-3 text-right">Action</th></tr></thead><tbody id="list"></tbody></table></div><script>let T=localStorage.getItem("t");const getId=i=>document.getElementById(i).value;if(T)show();function login(){T=getId("pw");localStorage.setItem("t",T);show()}function logout(){localStorage.removeItem("t");location.reload()}function show(){document.getElementById("auth").classList.add("hidden");document.getElementById("app").classList.remove("hidden");load()}async function api(e,d={}){d.adminPass=T;await fetch(e,{method:"POST",body:JSON.stringify(d)});if(e.includes("list"))return;load()}async function load(){const r=await fetch("/api/list",{method:"POST",body:JSON.stringify({adminPass:T})});const j=await r.json();if(j.status!="success")return;const l=document.getElementById("list");l.innerHTML="";j.data.sort((a,b)=>a.expiry-b.expiry).forEach(u=>{const d=Math.ceil((u.expiry-Date.now())/86400000);const dev=u.device_id?"<span class='text-cyan-300'>Locked</span>":"<span class='text-gray-500'>--</span>";l.innerHTML+=\`<tr class="border-b border-gray-700"><td class="p-3 font-bold">\${u.username}</td><td class="p-3 opacity-75">\${u.password}</td><td class="p-3">\${new Date(u.expiry).toLocaleDateString()} (\${d}d)</td><td class="p-3">\${dev}</td><td class="p-3 text-right"><button onclick="api('/api/resetid',{username:'\${u.username}'})" class="text-yellow-400 mr-2">Reset</button><button onclick="api('/api/extend',{username:'\${u.username}',days:30})" class="text-blue-400 mr-2">Renew</button><button onclick="api('/api/delete',{username:'\${u.username}'})" class="text-red-400">Del</button></td></tr>\`})}</script></body></html>`;
 }
