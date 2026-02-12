@@ -1,5 +1,3 @@
-import { encodeHex } from "https://deno.land/std/encoding/hex.ts";
-
 const kv = await Deno.openKv();
 
 const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD");
@@ -11,7 +9,9 @@ if (!ADMIN_PASSWORD) {
 async function hashPassword(password: string): Promise<string> {
   const data = new TextEncoder().encode(password);
   const hash = await crypto.subtle.digest("SHA-256", data);
-  return encodeHex(new Uint8Array(hash));
+  return [...new Uint8Array(hash)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function escapeHtml(str: string): string {
@@ -25,13 +25,13 @@ function escapeHtml(str: string): string {
 
 const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "*";
 
-const corsHeaders = {
+const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const headers = {
+const headers: Record<string, string> = {
   "content-type": "application/json; charset=utf-8",
   ...corsHeaders,
 };
@@ -61,30 +61,33 @@ Deno.serve(async (req) => {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  // ── Parse params ──
-  let params: Record<string, string> = {};
-  try {
-    const text = await req.text();
-    if (text.startsWith("{")) params = JSON.parse(text);
-    else if (text) params = Object.fromEntries(new URLSearchParams(text));
-  } catch (_e) { /* ignore */ }
-
-  // ══════════════════════════════════════
-  //  PUBLIC ROUTES
-  // ══════════════════════════════════════
-
-  // ── GET / → Admin Panel HTML ──
+  // ── GET / → Admin Panel HTML (body မဖတ်ဘူး) ──
   if (req.method === "GET" && path === "/") {
     return new Response(renderHTML(), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
 
+  // ── Parse params (POST requests only) ──
+  let params: Record<string, string> = {};
+  try {
+    const text = await req.text();
+    if (text.startsWith("{")) params = JSON.parse(text);
+    else if (text) params = Object.fromEntries(new URLSearchParams(text));
+  } catch (_e) {
+    /* ignore */
+  }
+
+  // ══════════════════════════════════════
+  //  PUBLIC ROUTES
+  // ══════════════════════════════════════
+
   // ── /login ──
   if (path === "/login") {
     const { username, password, device_id } = params;
 
-    if (!username || !password) return fail("Username and password are required");
+    if (!username || !password)
+      return fail("Username and password are required");
 
     const entry = await kv.get(["users", username]);
     if (!entry.value) return fail("User not found");
@@ -327,7 +330,7 @@ function renderHTML(): string {
       <input id="u" placeholder="Username (3-30)" class="p-2 bg-gray-800 rounded flex-1 min-w-[100px] border border-gray-700">
       <input id="p" placeholder="Password (4+)" class="p-2 bg-gray-800 rounded flex-1 min-w-[100px] border border-gray-700">
       <input id="d" type="number" value="30" min="1" max="365" class="p-2 bg-gray-800 rounded w-20 border border-gray-700">
-      <button onclick="createUser()" class="bg-green-600 p-2 rounded hover:bg-green-700 px-4">Create</button>
+      <button id="createBtn" onclick="createUser()" class="bg-green-600 p-2 rounded hover:bg-green-700 px-4">Create</button>
     </div>
 
     <p id="msg" class="text-sm mb-3 hidden"></p>
@@ -361,7 +364,7 @@ function showMsg(text, isError) {
   el.textContent = text;
   el.className = "text-sm mb-3 " + (isError ? "text-red-400" : "text-green-400");
   el.classList.remove("hidden");
-  setTimeout(() => el.classList.add("hidden"), 3000);
+  setTimeout(function() { el.classList.add("hidden"); }, 3000);
 }
 
 async function login() {
@@ -401,7 +404,8 @@ function show() {
   load();
 }
 
-async function api(endpoint, data = {}) {
+async function api(endpoint, data) {
+  if (!data) data = {};
   data.adminPass = T;
   try {
     const r = await fetch(endpoint, {
@@ -416,33 +420,60 @@ async function api(endpoint, data = {}) {
     }
     return j;
   } catch (e) {
-    showMsg("Connection failed", true);
+    showMsg("Connection failed: " + e.message, true);
     return null;
   }
 }
 
 async function createUser() {
-  const username = document.getElementById("u").value.trim();
-  const password = document.getElementById("p").value.trim();
-  const days = document.getElementById("d").value;
+  var btn = document.getElementById("createBtn");
+  btn.disabled = true;
+  btn.textContent = "Creating...";
 
-  if (!username || !password) {
-    showMsg("Username and password are required", true);
-    return;
-  }
+  try {
+    var username = document.getElementById("u").value.trim();
+    var password = document.getElementById("p").value.trim();
+    var days = document.getElementById("d").value.trim();
 
-  const result = await api("/api/create", { username, password, days });
-  if (result) {
-    showMsg("User created successfully", false);
-    document.getElementById("u").value = "";
-    document.getElementById("p").value = "";
-    load();
+    if (!username || !password) {
+      showMsg("Username and password are required", true);
+      return;
+    }
+
+    if (username.length < 3 || username.length > 30) {
+      showMsg("Username must be 3-30 characters", true);
+      return;
+    }
+
+    if (password.length < 4) {
+      showMsg("Password must be at least 4 characters", true);
+      return;
+    }
+
+    if (!days || isNaN(parseInt(days)) || parseInt(days) <= 0) {
+      showMsg("Days must be a valid number", true);
+      return;
+    }
+
+    var result = await api("/api/create", { username: username, password: password, days: days });
+    if (result) {
+      showMsg("User '" + username + "' created successfully!", false);
+      document.getElementById("u").value = "";
+      document.getElementById("p").value = "";
+      document.getElementById("d").value = "30";
+      await load();
+    }
+  } catch (e) {
+    showMsg("Error: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Create";
   }
 }
 
 async function resetId(username) {
   if (!confirm("Reset device ID for " + username + "?")) return;
-  const result = await api("/api/resetid", { username });
+  var result = await api("/api/resetid", { username: username });
   if (result) {
     showMsg("Device ID reset", false);
     load();
@@ -450,9 +481,9 @@ async function resetId(username) {
 }
 
 async function extend(username) {
-  const days = prompt("How many days to extend?", "30");
+  var days = prompt("How many days to extend?", "30");
   if (!days) return;
-  const result = await api("/api/extend", { username, days });
+  var result = await api("/api/extend", { username: username, days: days });
   if (result) {
     showMsg("Extended " + days + " days", false);
     load();
@@ -461,7 +492,7 @@ async function extend(username) {
 
 async function deleteUser(username) {
   if (!confirm("Delete user " + username + "?")) return;
-  const result = await api("/api/delete", { username });
+  var result = await api("/api/delete", { username: username });
   if (result) {
     showMsg("User deleted", false);
     load();
@@ -469,34 +500,39 @@ async function deleteUser(username) {
 }
 
 async function changePass(username) {
-  const newPassword = prompt("New password for " + username + ":");
+  var newPassword = prompt("New password for " + username + ":");
   if (!newPassword) return;
   if (newPassword.length < 4) {
     showMsg("Password must be at least 4 characters", true);
     return;
   }
-  const result = await api("/api/changepass", { username, newPassword });
+  var result = await api("/api/changepass", { username: username, newPassword: newPassword });
   if (result) {
     showMsg("Password changed", false);
   }
 }
 
 async function load() {
-  const r = await api("/api/list");
+  var r = await api("/api/list");
   if (!r) return;
 
-  const tbody = document.getElementById("list");
+  var tbody = document.getElementById("list");
   tbody.innerHTML = "";
 
-  r.data.sort((a, b) => a.expiry - b.expiry).forEach(u => {
-    const d = Math.ceil((u.expiry - Date.now()) / 86400000);
-    const isExpired = d <= 0;
-    const daysText = isExpired ? "<span class='text-red-400'>Expired</span>" : d + "d";
-    const dev = u.device_id
+  if (!r.data || r.data.length === 0) {
+    tbody.innerHTML = "<tr><td colspan='4' class='p-3 text-center text-gray-500'>No users yet</td></tr>";
+    return;
+  }
+
+  r.data.sort(function(a, b) { return a.expiry - b.expiry; }).forEach(function(u) {
+    var d = Math.ceil((u.expiry - Date.now()) / 86400000);
+    var isExpired = d <= 0;
+    var daysText = isExpired ? "<span class='text-red-400'>Expired</span>" : d + "d";
+    var dev = u.device_id
       ? "<span class='text-cyan-300'>Locked</span>"
       : "<span class='text-gray-500'>--</span>";
 
-    const tr = document.createElement("tr");
+    var tr = document.createElement("tr");
     tr.className = "border-b border-gray-700";
     tr.innerHTML =
       "<td class='p-3 font-bold'>" + esc(u.username) + "</td>" +
@@ -504,27 +540,27 @@ async function load() {
       "<td class='p-3'>" + dev + "</td>" +
       "<td class='p-3 text-right'></td>";
 
-    const actionTd = tr.querySelector("td:last-child");
+    var actionTd = tr.querySelector("td:last-child");
 
-    const btnReset = document.createElement("button");
+    var btnReset = document.createElement("button");
     btnReset.textContent = "Reset";
     btnReset.className = "text-yellow-400 mr-2 hover:text-yellow-300";
-    btnReset.onclick = () => resetId(u.username);
+    btnReset.onclick = function() { resetId(u.username); };
 
-    const btnRenew = document.createElement("button");
+    var btnRenew = document.createElement("button");
     btnRenew.textContent = "Renew";
     btnRenew.className = "text-blue-400 mr-2 hover:text-blue-300";
-    btnRenew.onclick = () => extend(u.username);
+    btnRenew.onclick = function() { extend(u.username); };
 
-    const btnPass = document.createElement("button");
+    var btnPass = document.createElement("button");
     btnPass.textContent = "Pass";
     btnPass.className = "text-purple-400 mr-2 hover:text-purple-300";
-    btnPass.onclick = () => changePass(u.username);
+    btnPass.onclick = function() { changePass(u.username); };
 
-    const btnDel = document.createElement("button");
+    var btnDel = document.createElement("button");
     btnDel.textContent = "Del";
     btnDel.className = "text-red-400 hover:text-red-300";
-    btnDel.onclick = () => deleteUser(u.username);
+    btnDel.onclick = function() { deleteUser(u.username); };
 
     actionTd.appendChild(btnReset);
     actionTd.appendChild(btnRenew);
