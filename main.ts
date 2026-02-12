@@ -24,8 +24,7 @@ Deno.serve(async (req) => {
     }
   } catch (e) { }
   if (path.includes("login")) {
-    const { username, password, device_id } = params;
-    const userDeviceId = device_id || "unknown_device";
+    const { username, password } = params;
     const entry = await kv.get(["users", username]);
     if (!entry.value) {
       return new Response(JSON.stringify({ status: "fail", message: "User not found" }), { headers });
@@ -37,34 +36,47 @@ Deno.serve(async (req) => {
     if (Date.now() > account.expiry) {
       return new Response(JSON.stringify({ status: "expired", message: "Account Expired" }), { headers });
     }
-    if (account.device_id && account.device_id !== userDeviceId) {
-       return new Response(JSON.stringify({ status: "fail", message: "Device Mismatch! Contact Admin." }), { headers });
-    }
-    if (!account.device_id) {
-       account.device_id = userDeviceId;
-       await kv.set(["users", username], account);
-    }
     const remainingDays = Math.ceil((account.expiry - Date.now()) / (24 * 60 * 60 * 1000));
-    const responseData = {
-      "status": "login",
-      "user": username,
-      "expired_date": remainingDays.toString(), 
-      "access": "true",
-      "message": "Login Success"
-    };
-    return new Response(JSON.stringify(responseData), { headers });
+    const expiryString = remainingDays.toString();
+    if (account.device_id) {
+        return new Response(JSON.stringify({
+            "status": "re_login",
+            "user": username,
+            "expired_date": expiryString,
+            "device_id": account.device_id, 
+            "message": "Login Success",
+            "access": "true"
+        }), { headers });
+    }
+    return new Response(JSON.stringify({
+        "status": "login",
+        "user": username,
+        "expired_date": expiryString,
+        "message": "First Login Success",
+        "access": "true"
+    }), { headers });
+  }
+  if (path.includes("reupload") || path.includes("edit")) {
+     const { username, device_id } = params;
+     if (username && device_id) {
+         const entry = await kv.get(["users", username]);
+         if (entry.value) {
+             const account = entry.value;
+             if (!account.device_id) {
+                 account.device_id = device_id;
+                 await kv.set(["users", username], account);
+             }
+         }
+     }
+     return new Response(JSON.stringify({"status": "success"}), { headers });
   }
   if (path.includes("checkUsername") || path.includes("exist")) {
      const { username } = params;
      const entry = await kv.get(["users", username]);
      if (entry.value && entry.value.expiry > Date.now()) {
          return new Response(JSON.stringify({"status": "success"}), { headers });
-     } else {
-         return new Response(JSON.stringify({"status": "fail"}), { headers });
      }
-  }
-  if (path.includes("reupload") || path.includes("edit")) {
-     return new Response(JSON.stringify({"status": "success"}), { headers });
+     return new Response(JSON.stringify({"status": "fail"}), { headers });
   }
   if (path.includes("delete")) {
      const username = params.usernameToDelete || params.username;
@@ -112,7 +124,7 @@ Deno.serve(async (req) => {
         return new Response(JSON.stringify({ status: "success" }), { headers });
     }
   }
-  return new Response("VIP Server", { status: 404 });
+  return new Response("VIP Server Online", { status: 404 });
 });
 function renderHTML() {
   return `
@@ -121,7 +133,7 @@ function renderHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VIP Manager (Device Lock)</title>
+    <title>VIP Manager</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body{background:#0f172a;color:white;}</style>
 </head>
@@ -174,15 +186,15 @@ function renderHTML() {
             const tb = document.getElementById("list"); tb.innerHTML = "";
             res.data.sort((a,b)=>a.expiry-b.expiry).forEach(u => {
                 const days = Math.ceil((u.expiry - Date.now())/86400000);
-                const dev = u.device_id ? u.device_id.substring(0,8)+"..." : "<span class='text-green-400'>Free</span>";
+                const dev = u.device_id ? "<span class='font-mono text-cyan-300'>"+u.device_id+"</span>" : "<span class='text-gray-500'>Waiting...</span>";
                 const row = \`
                 <tr class="border-b border-slate-700 hover:bg-slate-700">
                     <td class="p-3 font-bold">\${u.username}</td>
                     <td class="p-3 text-slate-400">\${u.password}</td>
                     <td class="p-3">\${new Date(u.expiry).toLocaleDateString()} (\${days}d)</td>
-                    <td class="p-3 text-xs font-mono">\${dev}</td>
+                    <td class="p-3 text-xs">\${dev}</td>
                     <td class="p-3 text-right space-x-1">
-                        <button onclick="reset('\${u.username}')" class="bg-yellow-600 text-white px-2 py-1 rounded text-xs" title="Reset Device">Reset ID</button>
+                        <button onclick="reset('\${u.username}')" class="bg-yellow-600 text-white px-2 py-1 rounded text-xs">Reset ID</button>
                         <button onclick="ext('\${u.username}')" class="bg-blue-600 text-white px-2 py-1 rounded text-xs">Renew</button>
                         <button onclick="del('\${u.username}')" class="bg-red-600 text-white px-2 py-1 rounded text-xs">Del</button>
                     </td>
@@ -193,7 +205,7 @@ function renderHTML() {
         async function create() { await req("/api/create", { username: document.getElementById("u").value, password: document.getElementById("p").value, days: document.getElementById("d").value }); document.getElementById("u").value=""; load(); }
         async function ext(u) { const d = prompt("Days:", "30"); if(d) { await req("/api/extend", {username:u, days:d}); load(); } }
         async function del(u) { if(confirm("Del?")) { await req("/api/delete", {username:u}); load(); } }
-        async function reset(u) { if(confirm("Reset Device ID for "+u+"?")) { await req("/api/resetid", {username:u}); load(); } }
+        async function reset(u) { if(confirm("Reset Device ID?")) { await req("/api/resetid", {username:u}); load(); } }
     </script>
 </body>
 </html>
