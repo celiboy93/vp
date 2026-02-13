@@ -1,11 +1,9 @@
 const kv = await Deno.openKv();
-
 const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD");
 if (!ADMIN_PASSWORD) {
   console.error("ADMIN_PASSWORD environment variable is required!");
   Deno.exit(1);
 }
-
 async function hashPassword(password: string): Promise<string> {
   const data = new TextEncoder().encode(password);
   const hash = await crypto.subtle.digest("SHA-256", data);
@@ -13,7 +11,6 @@ async function hashPassword(password: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
-
 function escapeHtml(str: string): string {
   return str
     .replace(/&/g, "&amp;")
@@ -22,41 +19,30 @@ function escapeHtml(str: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
-
 const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "*";
-
 const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
-
 const headers: Record<string, string> = {
   "content-type": "application/json; charset=utf-8",
   ...corsHeaders,
 };
-
 function json(data: object, status = 200) {
   return new Response(JSON.stringify(data), { status, headers });
 }
-
 function fail(message: string, status = 400) {
   return json({ status: "fail", message }, status);
 }
-
 function success(data: object = {}) {
   return json({ status: "success", ...data });
 }
-
 function isAdmin(params: Record<string, string>) {
   return params.adminPass === ADMIN_PASSWORD;
 }
-
-// ── Duration parsing: "30d", "12h", "1d12h" etc ──
 function parseDuration(input: string): number | null {
   const s = input.trim().toLowerCase();
-
-  // "30d12h" format
   const combo = s.match(/^(?:(\d+)d)?(?:(\d+)h)?$/);
   if (combo && (combo[1] || combo[2])) {
     const days = parseInt(combo[1] || "0");
@@ -65,35 +51,12 @@ function parseDuration(input: string): number | null {
     if (days > 365 || hours > 8760) return null;
     return (days * 24 + hours) * 3600000;
   }
-
-  // plain number = days
   const num = parseInt(s);
   if (!isNaN(num) && num > 0 && num <= 365) {
     return num * 86400000;
   }
-
   return null;
 }
-
-function formatDuration(ms: number): string {
-  const totalHours = Math.ceil(ms / 3600000);
-  const days = Math.floor(totalHours / 24);
-  const hours = totalHours % 24;
-  if (days > 0 && hours > 0) return `${days}d ${hours}h`;
-  if (days > 0) return `${days}d`;
-  return `${hours}h`;
-}
-
-function formatRemaining(ms: number): string {
-  if (ms <= 0) return "Expired";
-  const totalHours = Math.ceil(ms / 3600000);
-  const days = Math.floor(totalHours / 24);
-  const hours = totalHours % 24;
-  if (days > 0 && hours > 0) return `${days}d ${hours}h`;
-  if (days > 0) return `${days}d`;
-  return `${hours}h`;
-}
-
 function formatDateMyanmar(ts: number): string {
   const d = new Date(ts);
   const yyyy = d.getFullYear();
@@ -103,22 +66,17 @@ function formatDateMyanmar(ts: number): string {
   const min = String(d.getMinutes()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
 }
-
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   const path = url.pathname;
-
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
-
   if (req.method === "GET" && path === "/") {
     return new Response(renderHTML(), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
-
-  // ── Voucher page ──
   if (req.method === "GET" && path === "/voucher") {
     const u = url.searchParams.get("u") || "";
     const p = url.searchParams.get("p") || "";
@@ -129,61 +87,47 @@ Deno.serve(async (req) => {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
-
   let params: Record<string, string> = {};
   try {
     const text = await req.text();
     if (text.startsWith("{")) params = JSON.parse(text);
     else if (text) params = Object.fromEntries(new URLSearchParams(text));
   } catch (_e) {
-    /* ignore */
   }
-
-  // ══════════════════════════════════════
-  //  PUBLIC ROUTES (APK ခေါ်သုံးတဲ့ endpoint များ)
-  // ══════════════════════════════════════
-
-  // ── /login ──
   if (path === "/login") {
     const { username, password, device_id } = params;
-
     if (!username || !password)
       return fail("Username and password are required");
-
-    const entry = await kv.get(["users", username]);
+    const [entry, inputHash] = await Promise.all([
+      kv.get(["users", username]),
+      hashPassword(password),
+    ]);
     if (!entry.value) return fail("User not found");
-
     const account = entry.value as any;
-    const inputHash = await hashPassword(password);
-
     if (account.password !== inputHash) return fail("Wrong Password");
-
     if (Date.now() > account.expiry) {
       return json({ status: "expired", message: "Expired" });
     }
-
-    // force_relogin စစ်မယ် — password ပြောင်းထားရင် wrong password ပြမယ်
     if (account.force_relogin) {
       return fail("Wrong Password");
     }
-
     const userDevId = device_id || "unknown";
-
     if (account.device_id && account.device_id !== userDevId) {
       return fail("Device Mismatch");
     }
-
     const remainingMs = account.expiry - Date.now();
     const remainingDays = Math.ceil(remainingMs / 86400000);
-
-    if (!account.device_id && userDevId !== "unknown") {
-      account.device_id = userDevId;
+    const needsUpdate =
+      (!account.device_id && userDevId !== "unknown") ||
+      account.force_relogin;
+    if (needsUpdate) {
+      if (!account.device_id && userDevId !== "unknown") {
+        account.device_id = userDevId;
+      }
+      account.force_relogin = false;
+      await kv.set(["users", username], account);
     }
-    account.force_relogin = false;
-    await kv.set(["users", username], account);
-
     const isReLogin = !!account.device_id && account.device_id === userDevId;
-
     return json({
       status: isReLogin ? "re_login" : "login",
       user: username,
@@ -194,63 +138,33 @@ Deno.serve(async (req) => {
       access: "true",
     });
   }
-
-  // ── /reupload or /edit ──
   if (path === "/reupload" || path === "/edit") {
     const { username, device_id } = params;
-
     if (!username) return fail("Username is required");
-
     const entry = await kv.get(["users", username]);
     if (!entry.value) return fail("User not found");
-
     const acc = entry.value as any;
-
-    // force_relogin ရှိရင် fail
     if (acc.force_relogin) return fail("User not found");
-
     if (!acc.device_id && device_id) {
       acc.device_id = device_id;
       await kv.set(["users", username], acc);
     }
-
     return success();
   }
-
-  // ── /checkUsername or /exist ──
   if (path === "/checkUsername" || path === "/exist") {
     const { username } = params;
-
     if (!username) return fail("Username is required");
-
     const entry = await kv.get(["users", username]);
-
     if (!entry.value) return fail("User not found or expired");
-
     const acc = entry.value as any;
-
-    // force_relogin flag ရှိရင် fail ပြန်ပေးမယ်
-    if (acc.force_relogin) {
-      return fail("User not found or expired");
-    }
-
-    if (acc.expiry > Date.now()) {
-      return success();
-    }
-
+    if (acc.force_relogin) return fail("User not found or expired");
+    if (acc.expiry > Date.now()) return success();
     return fail("User not found or expired");
   }
-
-  // ══════════════════════════════════════
-  //  ADMIN ROUTES (/api/*)
-  // ══════════════════════════════════════
-
   if (path.startsWith("/api/")) {
     if (!isAdmin(params)) {
       return fail("Unauthorized", 401);
     }
-
-    // ── /api/list ──
     if (path === "/api/list") {
       const users: any[] = [];
       for await (const entry of kv.list({ prefix: ["users"] })) {
@@ -258,37 +172,30 @@ Deno.serve(async (req) => {
       }
       return success({ data: users });
     }
-
-    // ── /api/create ──
     if (path === "/api/create") {
       const { username, password, duration } = params;
-
       if (!username || !password || !duration) {
         return fail("username, password, duration are required");
       }
-
       if (username.length < 3 || username.length > 30) {
         return fail("Username must be 3-30 characters");
       }
-
       if (password.length < 4) {
         return fail("Password must be at least 4 characters");
       }
-
       const durationMs = parseDuration(duration);
       if (!durationMs) {
         return fail("Invalid duration. Use: 30d, 12h, 1d12h");
       }
-
-      const existing = await kv.get(["users", username]);
+      const [hashedPw, existing] = await Promise.all([
+        hashPassword(password),
+        kv.get(["users", username]),
+      ]);
       if (existing.value) {
         return fail("User already exists");
       }
-
-      const hashedPw = await hashPassword(password);
       const now = Date.now();
       const exp = now + durationMs;
-
       await kv.set(["users", username], {
         username,
         password: hashedPw,
@@ -298,7 +205,6 @@ Deno.serve(async (req) => {
         created_at: now,
         package_label: duration,
       });
-
       return success({
         voucher: {
           username,
@@ -309,103 +215,73 @@ Deno.serve(async (req) => {
         },
       });
     }
-
-    // ── /api/resetid ──
     if (path === "/api/resetid") {
       const { username } = params;
       if (!username) return fail("Username is required");
-
       const e = await kv.get(["users", username]);
       if (!e.value) return fail("User not found");
-
       (e.value as any).device_id = null;
       await kv.set(["users", username], e.value);
-
       return success();
     }
-
-    // ── /api/extend ──
     if (path === "/api/extend") {
       const { username, duration } = params;
       if (!username || !duration)
         return fail("username and duration are required");
-
       const durationMs = parseDuration(duration);
       if (!durationMs) {
         return fail("Invalid duration. Use: 30d, 12h, 1d12h");
       }
-
       const e = await kv.get(["users", username]);
       if (!e.value) return fail("User not found");
-
       const acc = e.value as any;
       acc.expiry = Math.max(Date.now(), acc.expiry) + durationMs;
       await kv.set(["users", username], acc);
-
       return success();
     }
-
-    // ── /api/delete ──
     if (path === "/api/delete") {
       const { username } = params;
       if (!username) return fail("Username is required");
-
       const existing = await kv.get(["users", username]);
       if (!existing.value) return fail("User not found");
-
       await kv.delete(["users", username]);
       return success();
     }
-
-    // ── /api/changepass ──
     if (path === "/api/changepass") {
       const { username, newPassword } = params;
       if (!username || !newPassword) {
         return fail("username and newPassword are required");
       }
-
       if (newPassword.length < 4) {
         return fail("Password must be at least 4 characters");
       }
-
-      const e = await kv.get(["users", username]);
+      const [hashedPw, e] = await Promise.all([
+        hashPassword(newPassword),
+        kv.get(["users", username]),
+      ]);
       if (!e.value) return fail("User not found");
-
       const acc = e.value as any;
-      acc.password = await hashPassword(newPassword);
+      acc.password = hashedPw;
       acc.device_id = null;
       acc.force_relogin = true;
       await kv.set(["users", username], acc);
-
       return success();
     }
-
-    // ── /api/forcelogout ──
     if (path === "/api/forcelogout") {
       const { username } = params;
       if (!username) return fail("Username is required");
-
       const e = await kv.get(["users", username]);
       if (!e.value) return fail("User not found");
-
       const acc = e.value as any;
       acc.device_id = null;
       acc.force_relogin = true;
       await kv.set(["users", username], acc);
-
       return success({ message: "User forcefully logged out" });
     }
-
     return fail("Unknown API endpoint", 404);
   }
-
   return new Response("VIP Server", { status: 200 });
 });
-
-// ══════════════════════════════════════
-//  VOUCHER HTML
-// ══════════════════════════════════════
-
 function renderVoucher(
   username: string,
   password: string,
@@ -415,7 +291,6 @@ function renderVoucher(
 ): string {
   const expDate = formatDateMyanmar(parseInt(expiry));
   const createdDate = formatDateMyanmar(parseInt(created));
-
   return `<!DOCTYPE html>
 <html lang="my">
 <head>
@@ -575,22 +450,25 @@ function renderVoucher(
       box-shadow: 0 6px 30px rgba(6, 182, 212, 0.5);
     }
     .download-btn:active { transform: translateY(0); }
+    .dl-mode .voucher::before { display: none !important; }
+    .dl-mode .voucher {
+      animation: none !important;
+      box-shadow: 0 0 40px rgba(6,182,212,0.15) !important;
+    }
   </style>
 </head>
 <body>
-  <div class="voucher-wrap">
+  <div class="voucher-wrap" id="voucherWrap">
     <div class="voucher" id="voucherCard">
       <div class="header">
         <div class="crown">👑</div>
         <h1>KP VPN VIP</h1>
         <div class="subtitle">Premium Account Voucher</div>
       </div>
-
       <div class="divider" style="height:24px;position:relative;">
         <div class="circle-left"></div>
         <div class="circle-right"></div>
       </div>
-
       <div class="body">
         <div class="info-row">
           <span class="info-label">Username</span>
@@ -613,18 +491,15 @@ function renderVoucher(
           <span class="info-value">${escapeHtml(expDate)}</span>
         </div>
       </div>
-
       <div class="footer">
         <div class="thanks">ဝယ်ယူအားပေးမှုအတွက်<br>ကျေးဇူးတင်ပါသည် 🙏</div>
         <div class="note">KP VPN — Fast & Secure</div>
       </div>
     </div>
-
     <button class="download-btn" id="dlBtn" onclick="downloadVoucher()">
       📥 Download Voucher
     </button>
   </div>
-
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script>
     async function downloadVoucher() {
@@ -632,16 +507,31 @@ function renderVoucher(
       btn.textContent = 'Generating...';
       btn.disabled = true;
       try {
+        document.body.classList.add('dl-mode');
         var canvas = await html2canvas(document.getElementById('voucherCard'), {
           backgroundColor: '#0f172a',
           scale: 2,
           useCORS: true,
+          allowTaint: true,
+          logging: false,
+          onclone: function(clonedDoc) {
+            var style = clonedDoc.createElement('style');
+            style.textContent = '.voucher::before{display:none!important;} .voucher{animation:none!important;}';
+            clonedDoc.head.appendChild(style);
+            var card = clonedDoc.getElementById('voucherCard');
+            if (card) {
+              card.style.border = '2px solid #06b6d4';
+              card.style.boxShadow = '0 0 40px rgba(6,182,212,0.15), 0 20px 60px rgba(0,0,0,0.5)';
+            }
+          }
         });
+        document.body.classList.remove('dl-mode');
         var link = document.createElement('a');
         link.download = 'KP_VPN_VIP_${escapeHtml(username)}.png';
         link.href = canvas.toDataURL('image/png');
         link.click();
       } catch(e) {
+        document.body.classList.remove('dl-mode');
         alert('Download failed: ' + e.message);
       }
       btn.textContent = '📥 Download Voucher';
@@ -651,11 +541,6 @@ function renderVoucher(
 </body>
 </html>`;
 }
-
-// ══════════════════════════════════════
-//  ADMIN PANEL HTML
-// ══════════════════════════════════════
-
 function renderHTML(): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -676,37 +561,68 @@ function renderHTML(): string {
     .status-active { color: #34d399; }
     .status-expired { color: #f87171; }
     .status-kicked { color: #fbbf24; }
+    .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .table-wrap table {
+      min-width: 700px;
+    }
+    @media (max-width: 640px) {
+      .create-form {
+        flex-direction: column !important;
+      }
+      .create-form input,
+      .create-form button {
+        width: 100% !important;
+        min-width: unset !important;
+      }
+      .stats-row {
+        flex-direction: column;
+      }
+      .stats-row > div {
+        min-width: unset !important;
+      }
+      .app-header {
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-start !important;
+      }
+      .app-header h1 {
+        font-size: 1.2rem !important;
+      }
+      #voucherModal .modal-content {
+        max-height: 90vh;
+        overflow-y: auto;
+      }
+    }
   </style>
 </head>
 <body class="flex justify-center p-4">
-
   <!-- Auth Screen -->
   <div id="auth" class="w-full max-w-sm mt-20 p-6 glass rounded-2xl">
     <div class="text-center mb-6">
       <div class="text-3xl mb-2">👑</div>
       <h2 class="text-xl text-cyan-400 font-bold">KP VPN Admin</h2>
     </div>
-    <input id="pw" type="password" class="w-full p-3 bg-gray-800/50 rounded-xl mb-4 border border-gray-700 transition-all" placeholder="Admin Password">
+    <input id="pw" type="password" class="w-full p-3 bg-gray-800/50 rounded-xl mb-4 border border-gray-700 transition-all" placeholder="Admin Password" onkeydown="if(event.key==='Enter')login()">
     <button onclick="login()" class="w-full bg-gradient-to-r from-cyan-600 to-purple-600 p-3 rounded-xl font-bold hover:opacity-90 transition-all btn-glow">LOGIN</button>
     <p id="loginErr" class="text-red-400 text-sm mt-3 hidden text-center"></p>
   </div>
-
   <!-- App Screen -->
   <div id="app" class="w-full max-w-5xl hidden">
-
     <!-- Header -->
-    <div class="flex justify-between items-center mb-6 mt-2">
+    <div class="flex justify-between items-center mb-6 mt-2 app-header">
       <div class="flex items-center gap-3">
         <span class="text-2xl">👑</span>
         <h1 class="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">KP VPN VIP Manager</h1>
       </div>
-      <button onclick="logout()" class="text-red-400 hover:text-red-300 text-sm border border-red-400/30 px-3 py-1 rounded-lg hover:bg-red-400/10 transition-all">Logout</button>
+      <button onclick="logout()" class="text-red-400 hover:text-red-300 text-sm border border-red-400/30 px-3 py-1 rounded-lg hover:bg-red-400/10 transition-all flex-shrink-0">Logout</button>
     </div>
-
     <!-- Create User Form -->
     <div class="glass rounded-2xl p-5 mb-5">
       <h3 class="text-sm text-cyan-400 font-bold mb-4 uppercase tracking-wider">Create New VIP Account</h3>
-      <div class="flex gap-3 flex-wrap">
+      <div class="flex gap-3 flex-wrap create-form">
         <input id="u" placeholder="Username (3-30)" class="p-3 bg-gray-800/50 rounded-xl flex-1 min-w-[120px] border border-gray-700 transition-all">
         <input id="p" placeholder="Password (4+)" class="p-3 bg-gray-800/50 rounded-xl flex-1 min-w-[120px] border border-gray-700 transition-all">
         <input id="d" value="30d" placeholder="e.g. 30d, 12h, 1d12h" class="p-3 bg-gray-800/50 rounded-xl w-32 border border-gray-700 transition-all">
@@ -714,28 +630,27 @@ function renderHTML(): string {
       </div>
       <p class="text-gray-500 text-xs mt-2">Duration format: 30d = 30 days, 12h = 12 hours, 1d12h = 1 day 12 hours</p>
     </div>
-
     <p id="msg" class="text-sm mb-3 hidden"></p>
-
-    <!-- Users Table -->
+    <!-- Users Table — scroll wrapper -->
     <div class="glass rounded-2xl overflow-hidden">
-      <table class="w-full text-sm">
-        <thead class="bg-gray-900/50 text-left">
-          <tr>
-            <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">User</th>
-            <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Expires</th>
-            <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Remaining</th>
-            <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Device</th>
-            <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Status</th>
-            <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider text-right">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="list"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-900/50 text-left">
+            <tr>
+              <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">User</th>
+              <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Expires</th>
+              <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Remaining</th>
+              <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Device</th>
+              <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider">Status</th>
+              <th class="p-4 text-cyan-400 font-bold text-xs uppercase tracking-wider text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="list"></tbody>
+        </table>
+      </div>
     </div>
-
     <!-- Stats -->
-    <div class="flex gap-4 mt-5 flex-wrap">
+    <div class="flex gap-4 mt-5 flex-wrap stats-row">
       <div class="glass rounded-xl p-4 flex-1 min-w-[150px] text-center">
         <div class="text-2xl font-bold text-cyan-400" id="totalUsers">0</div>
         <div class="text-xs text-gray-400 mt-1">Total Users</div>
@@ -749,12 +664,10 @@ function renderHTML(): string {
         <div class="text-xs text-gray-400 mt-1">Expired</div>
       </div>
     </div>
-
   </div>
-
   <!-- Voucher Modal -->
   <div id="voucherModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm hidden flex items-center justify-center z-50 p-4">
-    <div class="glass rounded-2xl p-6 max-w-md w-full">
+    <div class="glass rounded-2xl p-6 max-w-md w-full modal-content">
       <div class="flex justify-between items-center mb-4">
         <h3 class="text-cyan-400 font-bold">Account Created!</h3>
         <button onclick="closeVoucher()" class="text-gray-400 hover:text-white text-xl">&times;</button>
@@ -781,17 +694,14 @@ function renderHTML(): string {
       </div>
     </div>
   </div>
-
 <script>
-let T = sessionStorage.getItem("t");
+var T = sessionStorage.getItem("t");
 if (T) show();
-
 function esc(s) {
   var d = document.createElement("div");
   d.textContent = s;
   return d.innerHTML;
 }
-
 function fmtDate(ts) {
   var d = new Date(ts);
   return d.getFullYear() + '-' +
@@ -800,7 +710,6 @@ function fmtDate(ts) {
     String(d.getHours()).padStart(2,'0') + ':' +
     String(d.getMinutes()).padStart(2,'0');
 }
-
 function fmtRemaining(ms) {
   if (ms <= 0) return '<span class="text-red-400">Expired</span>';
   var totalH = Math.ceil(ms / 3600000);
@@ -810,7 +719,6 @@ function fmtRemaining(ms) {
   if (days > 0) return days + 'd';
   return hours + 'h';
 }
-
 function showMsg(text, isError) {
   var el = document.getElementById("msg");
   el.textContent = text;
@@ -818,7 +726,6 @@ function showMsg(text, isError) {
   el.classList.remove("hidden");
   setTimeout(function() { el.classList.add("hidden"); }, 3000);
 }
-
 async function login() {
   T = document.getElementById("pw").value;
   if (!T) return;
@@ -843,18 +750,15 @@ async function login() {
     errEl.classList.remove("hidden");
   }
 }
-
 function logout() {
   sessionStorage.removeItem("t");
   location.reload();
 }
-
 function show() {
   document.getElementById("auth").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
   load();
 }
-
 async function api(endpoint, data) {
   if (!data) data = {};
   data.adminPass = T;
@@ -875,9 +779,7 @@ async function api(endpoint, data) {
     return null;
   }
 }
-
 var lastVoucher = null;
-
 async function createUser() {
   var btn = document.getElementById("createBtn");
   btn.disabled = true;
@@ -890,7 +792,6 @@ async function createUser() {
     if (username.length < 3 || username.length > 30) { showMsg("Username must be 3-30 characters", true); return; }
     if (password.length < 4) { showMsg("Password must be at least 4 characters", true); return; }
     if (!duration) { showMsg("Duration is required", true); return; }
-
     var result = await api("/api/create", { username: username, password: password, duration: duration });
     if (result) {
       lastVoucher = { username: username, password: password, pkg: duration, exp: result.voucher.expiry, created: result.voucher.created_at };
@@ -903,28 +804,23 @@ async function createUser() {
   } catch (e) { showMsg("Error: " + e.message, true); }
   finally { btn.disabled = false; btn.textContent = "Create"; }
 }
-
 function showVoucher(v) {
   document.getElementById("vUser").textContent = v.username;
   document.getElementById("vPass").textContent = v.password;
   document.getElementById("vPkg").textContent = v.pkg;
   document.getElementById("vCreated").textContent = fmtDate(v.created);
   document.getElementById("vExp").textContent = fmtDate(v.exp);
-
   var link = document.getElementById("voucherLink");
   link.href = "/voucher?u=" + encodeURIComponent(v.username) +
     "&p=" + encodeURIComponent(v.password) +
     "&pkg=" + encodeURIComponent(v.pkg) +
     "&exp=" + v.exp +
     "&created=" + v.created;
-
   document.getElementById("voucherModal").classList.remove("hidden");
 }
-
 function closeVoucher() {
   document.getElementById("voucherModal").classList.add("hidden");
 }
-
 function copyVoucherText() {
   if (!lastVoucher) return;
   var text = "👑 KP VPN VIP 👑\\n" +
@@ -936,33 +832,28 @@ function copyVoucherText() {
     "သက်တမ်းကုန်ဆုံးရက်: " + fmtDate(lastVoucher.exp) + "\\n" +
     "━━━━━━━━━━━━━━━━\\n" +
     "ဝယ်ယူအားပေးမှုအတွက် ကျေးဇူးတင်ပါသည် 🙏";
-
   navigator.clipboard.writeText(text).then(function() {
     showMsg("Copied to clipboard!", false);
   }).catch(function() {
     showMsg("Copy failed", true);
   });
 }
-
 async function resetId(username) {
   if (!confirm("Reset device ID for " + username + "?")) return;
   var result = await api("/api/resetid", { username: username });
   if (result) { showMsg("Device ID reset", false); load(); }
 }
-
 async function extend(username) {
   var duration = prompt("Duration to extend? (e.g. 30d, 12h, 1d12h)", "30d");
   if (!duration) return;
   var result = await api("/api/extend", { username: username, duration: duration });
   if (result) { showMsg("Extended: " + duration, false); load(); }
 }
-
 async function deleteUser(username) {
   if (!confirm("Delete user " + username + "?")) return;
   var result = await api("/api/delete", { username: username });
   if (result) { showMsg("User deleted", false); load(); }
 }
-
 async function changePass(username) {
   var newPassword = prompt("New password for " + username + ":");
   if (!newPassword) return;
@@ -970,21 +861,17 @@ async function changePass(username) {
   var result = await api("/api/changepass", { username: username, newPassword: newPassword });
   if (result) { showMsg("Password changed & user kicked", false); load(); }
 }
-
 async function forceLogout(username) {
   if (!confirm("Force logout " + username + "?")) return;
   var result = await api("/api/forcelogout", { username: username });
   if (result) { showMsg("User force logged out", false); load(); }
 }
-
 async function load() {
   var r = await api("/api/list");
   if (!r) return;
   var tbody = document.getElementById("list");
   tbody.innerHTML = "";
-
   var total = 0, active = 0, expired = 0;
-
   if (!r.data || r.data.length === 0) {
     tbody.innerHTML = "<tr><td colspan='6' class='p-6 text-center text-gray-500'>No users yet</td></tr>";
   } else {
@@ -993,9 +880,7 @@ async function load() {
       var remaining = u.expiry - Date.now();
       var isExpired = remaining <= 0;
       if (isExpired) expired++; else active++;
-
       var dev = u.device_id ? "<span class='text-cyan-300'>🔒 Locked</span>" : "<span class='text-gray-500'>—</span>";
-
       var statusText;
       if (u.force_relogin) {
         statusText = "<span class='status-kicked'>⚠ Kicked</span>";
@@ -1004,7 +889,6 @@ async function load() {
       } else {
         statusText = "<span class='status-active'>✓ Active</span>";
       }
-
       var tr = document.createElement("tr");
       tr.className = "border-b border-gray-800/50 hover:bg-gray-800/30 transition-all";
       tr.innerHTML =
@@ -1014,7 +898,6 @@ async function load() {
         "<td class='p-4 text-xs'>" + dev + "</td>" +
         "<td class='p-4 text-xs font-bold'>" + statusText + "</td>" +
         "<td class='p-4 text-right'></td>";
-
       var actionTd = tr.querySelector("td:last-child");
       var actions = [
         { text: "Reset", cls: "text-yellow-400 hover:bg-yellow-400/10", fn: function() { resetId(u.username); } },
@@ -1030,11 +913,9 @@ async function load() {
         btn.onclick = a.fn;
         actionTd.appendChild(btn);
       });
-
       tbody.appendChild(tr);
     });
   }
-
   document.getElementById("totalUsers").textContent = total;
   document.getElementById("activeUsers").textContent = active;
   document.getElementById("expiredUsers").textContent = expired;
